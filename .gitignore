@@ -1,0 +1,4 @@
+dist/
+*.exe
+*.pdb
+config.txt
