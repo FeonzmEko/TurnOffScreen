@@ -21,10 +21,15 @@ static class Program
     private const int WM_HOTKEY = 0x0312;
     private const uint MOD_ALT = 0x0001;
     private const uint MOD_CONTROL = 0x0002;
+    private const uint MOD_SHIFT = 0x0004;
+    private const uint MOD_WIN = 0x0008;
     private const uint MOD_NOREPEAT = 0x4000;
-    private const uint VK_O = 0x4F;
+
+    private const int VK_SHIFT = 0x10;
     private const int VK_CONTROL = 0x11;
     private const int VK_MENU = 0x12;
+    private const int VK_LWIN = 0x5B;
+    private const int VK_RWIN = 0x5C;
 
     private const int WS_EX_TOOLWINDOW = 0x00000080;
     private const int WS_EX_TOPMOST = 0x00000008;
@@ -32,6 +37,9 @@ static class Program
     private const string MutexName = "Local\\TurnOffScreenHotkeySingleton";
     private const string TriggerEventName = "Local\\TurnOffScreenTriggerEvent";
     private const string PingEventName = "Local\\TurnOffScreenPingEvent";
+
+    private const uint DefaultHotkeyMods = MOD_CONTROL | MOD_ALT;
+    private const Keys DefaultHotkeyKey = Keys.B;
 
     [DllImport("user32.dll")]
     private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
@@ -109,6 +117,78 @@ static class Program
 
     private static int _deepSleepMinutes = 10;
     private static bool _dimHardwareBrightness = true;
+    private static uint _hotkeyMods = DefaultHotkeyMods;
+    private static Keys _hotkeyKey = DefaultHotkeyKey;
+
+    private static string FormatKeyName(Keys key)
+    {
+        if (key >= Keys.D0 && key <= Keys.D9)
+            return ((int)(key - Keys.D0)).ToString();
+        return key.ToString();
+    }
+
+    private static string FormatHotkey(uint mods, Keys key)
+    {
+        var parts = new List<string>();
+        if ((mods & MOD_CONTROL) != 0) parts.Add("Ctrl");
+        if ((mods & MOD_ALT) != 0) parts.Add("Alt");
+        if ((mods & MOD_SHIFT) != 0) parts.Add("Shift");
+        if ((mods & MOD_WIN) != 0) parts.Add("Win");
+        parts.Add(FormatKeyName(key));
+        return string.Join("+", parts.ToArray());
+    }
+
+    private static bool TryParseHotkey(string raw, out uint mods, out Keys key)
+    {
+        mods = 0;
+        key = Keys.None;
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+
+        foreach (var token in raw.Split(new[] { '+' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string t = token.Trim();
+            if (t.Equals("Ctrl", StringComparison.OrdinalIgnoreCase) || t.Equals("Control", StringComparison.OrdinalIgnoreCase))
+            {
+                mods |= MOD_CONTROL;
+            }
+            else if (t.Equals("Alt", StringComparison.OrdinalIgnoreCase))
+            {
+                mods |= MOD_ALT;
+            }
+            else if (t.Equals("Shift", StringComparison.OrdinalIgnoreCase))
+            {
+                mods |= MOD_SHIFT;
+            }
+            else if (t.Equals("Win", StringComparison.OrdinalIgnoreCase))
+            {
+                mods |= MOD_WIN;
+            }
+            else
+            {
+                if (t.Length == 1 && t[0] >= '0' && t[0] <= '9')
+                {
+                    key = (Keys)((int)Keys.D0 + (t[0] - '0'));
+                }
+                else
+                {
+                    Keys parsed;
+                    if (!Enum.TryParse(t, true, out parsed) || parsed == Keys.None)
+                        return false;
+                    key = parsed;
+                }
+            }
+        }
+
+        return mods != 0 && key != Keys.None && !IsModifierKey(key);
+    }
+
+    private static bool IsModifierKey(Keys key)
+    {
+        return key == Keys.ControlKey || key == Keys.LControlKey || key == Keys.RControlKey ||
+               key == Keys.ShiftKey || key == Keys.LShiftKey || key == Keys.RShiftKey ||
+               key == Keys.Menu || key == Keys.LMenu || key == Keys.RMenu ||
+               key == Keys.LWin || key == Keys.RWin || key == Keys.None;
+    }
 
     private static void LoadConfig()
     {
@@ -134,6 +214,16 @@ static class Program
                     if (bool.TryParse(v, out b))
                         _dimHardwareBrightness = b;
                 }
+                else if (k == "Hotkey")
+                {
+                    uint m;
+                    Keys key;
+                    if (TryParseHotkey(v, out m, out key))
+                    {
+                        _hotkeyMods = m;
+                        _hotkeyKey = key;
+                    }
+                }
             }
         }
         catch { }
@@ -147,7 +237,8 @@ static class Program
             File.WriteAllLines(ConfigPath, new[]
             {
                 "DeepSleepMinutes=" + _deepSleepMinutes,
-                "DimHardwareBrightness=" + _dimHardwareBrightness
+                "DimHardwareBrightness=" + _dimHardwareBrightness,
+                "Hotkey=" + FormatHotkey(_hotkeyMods, _hotkeyKey)
             });
         }
         catch { }
@@ -313,7 +404,6 @@ static class Program
             {
                 if (shouldAbort()) return;
 
-                // 1. External monitors via DDC/CI
                 if (!_isDdcDimmed)
                 {
                     _savedDdc.Clear();
@@ -330,7 +420,6 @@ static class Program
 
                 if (shouldAbort()) return;
 
-                // 2. Built-in laptop panels via WMI
                 if (!_isWmiDimmed)
                 {
                     _savedWmi.Clear();
@@ -484,9 +573,13 @@ static class Program
 
         private static bool IsHotkeyHeld()
         {
-            return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
-                   (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
-                   (GetAsyncKeyState((int)VK_O) & 0x8000) != 0;
+            if ((_hotkeyMods & MOD_CONTROL) != 0 && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) return true;
+            if ((_hotkeyMods & MOD_ALT) != 0 && (GetAsyncKeyState(VK_MENU) & 0x8000) != 0) return true;
+            if ((_hotkeyMods & MOD_SHIFT) != 0 && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) return true;
+            if ((_hotkeyMods & MOD_WIN) != 0 &&
+                ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0)) return true;
+            if ((GetAsyncKeyState((int)_hotkeyKey) & 0x8000) != 0) return true;
+            return false;
         }
 
         public void EnterSoftBlackout(bool fromHotkey)
@@ -719,6 +812,107 @@ static class Program
         }
     }
 
+    private static Tuple<uint, Keys> PromptCustomHotkey(uint currentMods, Keys currentKey)
+    {
+        uint pickedMods = currentMods;
+        Keys pickedKey = currentKey;
+
+        using (var dlg = new Form())
+        {
+            dlg.Text = "修改全局息屏快捷键";
+            dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+            dlg.MaximizeBox = false;
+            dlg.MinimizeBox = false;
+            dlg.StartPosition = FormStartPosition.CenterScreen;
+            dlg.TopMost = true;
+            dlg.AutoScaleMode = AutoScaleMode.Font;
+            dlg.ClientSize = new Size(370, 145);
+
+            var lbl = new Label
+            {
+                Text = "点击下方输入框，直接按下想要的组合键（需含 Ctrl/Alt/Shift）：",
+                Location = new Point(16, 14),
+                AutoSize = true
+            };
+
+            var box = new TextBox
+            {
+                ReadOnly = true,
+                BackColor = SystemColors.Window,
+                TextAlign = HorizontalAlignment.Center,
+                Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 11f, FontStyle.Bold),
+                Text = FormatHotkey(pickedMods, pickedKey),
+                Location = new Point(16, 44),
+                Width = 338
+            };
+
+            box.KeyDown += (s, e) =>
+            {
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+
+                if (e.KeyCode == Keys.Escape && !e.Control && !e.Alt && !e.Shift)
+                {
+                    dlg.DialogResult = DialogResult.Cancel;
+                    dlg.Close();
+                    return;
+                }
+
+                if (IsModifierKey(e.KeyCode)) return;
+
+                uint m = 0;
+                if (e.Control) m |= MOD_CONTROL;
+                if (e.Alt) m |= MOD_ALT;
+                if (e.Shift) m |= MOD_SHIFT;
+
+                if (m == 0) return;
+
+                pickedMods = m;
+                pickedKey = e.KeyCode;
+                box.Text = FormatHotkey(pickedMods, pickedKey);
+            };
+
+            var resetBtn = new Button
+            {
+                Text = "恢复默认",
+                Location = new Point(16, 98),
+                Width = 86
+            };
+            resetBtn.Click += (s, e) =>
+            {
+                pickedMods = DefaultHotkeyMods;
+                pickedKey = DefaultHotkeyKey;
+                box.Text = FormatHotkey(pickedMods, pickedKey);
+                box.Focus();
+            };
+
+            var okBtn = new Button
+            {
+                Text = "确定",
+                DialogResult = DialogResult.OK,
+                Location = new Point(194, 98),
+                Width = 75
+            };
+
+            var cancelBtn = new Button
+            {
+                Text = "取消",
+                DialogResult = DialogResult.Cancel,
+                Location = new Point(279, 98),
+                Width = 75
+            };
+
+            dlg.Controls.AddRange(new Control[] { lbl, box, resetBtn, okBtn, cancelBtn });
+            dlg.Shown += (s, e) => box.Focus();
+
+            if (dlg.ShowDialog() == DialogResult.OK)
+            {
+                return Tuple.Create(pickedMods, pickedKey);
+            }
+            return null;
+        }
+    }
+
     private static Icon CreatePowerIcon()
     {
         using (var bmp = new Bitmap(32, 32))
@@ -756,17 +950,38 @@ static class Program
     {
         public const int HotkeyId = 1;
         public bool Registered { get; private set; }
+        public uint ActiveMods { get; private set; }
+        public Keys ActiveKey { get; private set; }
+
         private readonly Action _onHotkey;
         private readonly Action _onTaskbarCreated;
         private readonly uint _taskbarCreatedMsg;
 
-        public HotkeyWindow(Action onHotkey, Action onTaskbarCreated)
+        public HotkeyWindow(uint mods, Keys key, Action onHotkey, Action onTaskbarCreated)
         {
             _onHotkey = onHotkey;
             _onTaskbarCreated = onTaskbarCreated;
             _taskbarCreatedMsg = RegisterWindowMessage("TaskbarCreated");
             CreateHandle(new CreateParams());
-            Registered = RegisterHotKey(Handle, HotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_O);
+            ReRegister(mods, key);
+        }
+
+        public void UnregisterCurrent()
+        {
+            if (Registered && Handle != IntPtr.Zero)
+            {
+                UnregisterHotKey(Handle, HotkeyId);
+                Registered = false;
+            }
+        }
+
+        public bool ReRegister(uint mods, Keys key)
+        {
+            UnregisterCurrent();
+            ActiveMods = mods;
+            ActiveKey = key;
+            Registered = RegisterHotKey(Handle, HotkeyId, mods | MOD_NOREPEAT, (uint)key);
+            return Registered;
         }
 
         protected override void WndProc(ref Message m)
@@ -784,11 +999,7 @@ static class Program
 
         public void Dispose()
         {
-            if (Registered)
-            {
-                UnregisterHotKey(Handle, HotkeyId);
-                Registered = false;
-            }
+            UnregisterCurrent();
             if (Handle != IntPtr.Zero)
             {
                 DestroyHandle();
@@ -845,22 +1056,34 @@ static class Program
             using (var tray = new NotifyIcon())
             using (var menu = new ContextMenuStrip())
             using (var hotkeyWin = new HotkeyWindow(
+                _hotkeyMods,
+                _hotkeyKey,
                 () => controller.EnterSoftBlackout(true),
                 () => { tray.Visible = false; tray.Visible = true; }))
             {
                 var _ = uiContext.Handle;
 
+                var blackoutItem = new ToolStripMenuItem("", null, (s, e) => controller.EnterSoftBlackout(false));
+                var deepSleepItem = new ToolStripMenuItem("立即深度关屏 (真断电)", null, (s, e) => controller.TriggerImmediateDeepSleep());
+                var changeHotkeyItem = new ToolStripMenuItem("");
+
                 Action updateTrayText = () =>
                 {
+                    string hkStr = FormatHotkey(_hotkeyMods, _hotkeyKey);
+                    string hkStatus = hotkeyWin.Registered ? hkStr : (hkStr + " [冲突]");
                     string delayDesc = _deepSleepMinutes > 0
                         ? (_deepSleepMinutes + "分钟后深度关屏")
                         : "仅极速黑屏";
-                    string txt = "一键关屏 (Ctrl+Alt+O) - " + delayDesc;
+
+                    blackoutItem.Text = "极速黑屏 / 秒醒 (" + hkStatus + ")";
+                    changeHotkeyItem.Text = "修改快捷键... (" + hkStatus + ")";
+
+                    string txt = "一键关屏 (" + hkStatus + ") - " + delayDesc;
                     tray.Text = txt.Length > 63 ? txt.Substring(0, 63) : txt;
                 };
 
-                menu.Items.Add("极速黑屏 / 秒醒 (Ctrl+Alt+O)", null, (s, e) => controller.EnterSoftBlackout(false));
-                menu.Items.Add("立即深度关屏 (真断电)", null, (s, e) => controller.TriggerImmediateDeepSleep());
+                menu.Items.Add(blackoutItem);
+                menu.Items.Add(deepSleepItem);
                 menu.Items.Add(new ToolStripSeparator());
 
                 var delayMenu = new ToolStripMenuItem("自动转深度关屏时间");
@@ -872,6 +1095,11 @@ static class Program
 
                 Action syncUiFromConfig = () =>
                 {
+                    if (hotkeyWin.ActiveMods != _hotkeyMods || hotkeyWin.ActiveKey != _hotkeyKey || !hotkeyWin.Registered)
+                    {
+                        hotkeyWin.ReRegister(_hotkeyMods, _hotkeyKey);
+                    }
+
                     bool matchedPreset = false;
                     foreach (var kv in presetItems)
                     {
@@ -930,6 +1158,39 @@ static class Program
                 delayMenu.DropDownItems.Add(customPromptItem);
                 menu.Items.Add(delayMenu);
 
+                changeHotkeyItem.Click += (s, e) =>
+                {
+                    uint oldMods = _hotkeyMods;
+                    Keys oldKey = _hotkeyKey;
+                    hotkeyWin.UnregisterCurrent();
+
+                    var picked = PromptCustomHotkey(oldMods, oldKey);
+                    if (picked != null)
+                    {
+                        if (hotkeyWin.ReRegister(picked.Item1, picked.Item2))
+                        {
+                            _hotkeyMods = picked.Item1;
+                            _hotkeyKey = picked.Item2;
+                            SaveConfig();
+                        }
+                        else
+                        {
+                            hotkeyWin.ReRegister(oldMods, oldKey);
+                            MessageBox.Show(
+                                "快捷键 " + FormatHotkey(picked.Item1, picked.Item2) + " 已被其他程序占用，请换一个组合键。",
+                                "快捷键冲突",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Warning);
+                        }
+                    }
+                    else
+                    {
+                        hotkeyWin.ReRegister(oldMods, oldKey);
+                    }
+                    syncUiFromConfig();
+                };
+                menu.Items.Add(changeHotkeyItem);
+
                 dimItem.Click += (s, e) =>
                 {
                     _dimHardwareBrightness = !_dimHardwareBrightness;
@@ -960,6 +1221,15 @@ static class Program
                 };
                 tray.Visible = true;
 
+                if (!hotkeyWin.Registered)
+                {
+                    tray.ShowBalloonTip(
+                        4000,
+                        "快捷键冲突：" + FormatHotkey(_hotkeyMods, _hotkeyKey),
+                        "该快捷键已被其他程序占用，请右键托盘图标选择「修改快捷键...」更换。",
+                        ToolTipIcon.Warning);
+                }
+
                 var stopSignal = new ManualResetEvent(false);
                 var listenerThread = new Thread(() =>
                 {
@@ -983,10 +1253,14 @@ static class Program
                                     syncUiFromConfig();
                                     tray.Visible = false;
                                     tray.Visible = true;
+                                    string hk = FormatHotkey(_hotkeyMods, _hotkeyKey);
                                     string status = _deepSleepMinutes > 0
                                         ? ("当前设置：" + _deepSleepMinutes + " 分钟后自动深度关屏")
                                         : "当前设置：仅极速黑屏";
-                                    tray.ShowBalloonTip(2500, "一键关屏已在运行 (Ctrl+Alt+O)", status, ToolTipIcon.Info);
+                                    if (!hotkeyWin.Registered)
+                                        status = "快捷键 " + hk + " 冲突，请右键托盘图标更换";
+                                    tray.ShowBalloonTip(2500, "一键关屏已在运行 (" + hk + ")", status,
+                                        hotkeyWin.Registered ? ToolTipIcon.Info : ToolTipIcon.Warning);
                                 }));
                             }
                             catch { break; }
