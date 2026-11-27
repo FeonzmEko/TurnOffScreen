@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build TurnOffScreen.exe
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\build.ps1
+          $hash = (Get-FileHash .\dist\TurnOffScreen.exe -Algorithm SHA256).Hash
+          "EXE_SHA256=$hash" >> $env:GITHUB_ENV
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if (-not $tag -or -not $tag.StartsWith('v')) {
+            $tag = 'v1.0.0'
+          }
+          $lines = @(
+            "## TurnOffScreen $tag",
+            "",
+            "Windows 极轻量（零依赖单文件）**两段式智能息屏**托盘小工具。",
+            "",
+            "### 核心特性",
+            "- **第一阶段（极速黑屏 / 秒醒）**：按 ``Ctrl + Alt + O`` 或单击托盘图标，瞬间全屏纯黑 + 隐藏鼠标，并自动将**外接显示器（DDC/CI）**与**笔记本内屏（WMI）**硬件背光压低至 ``0%``；动鼠标或按任意键 **< 0.1 秒秒亮**并自动还原原亮度。",
+            "- **第二阶段（自动深度关屏）**：黑屏超过设定时间无人操作（默认 10 分钟，支持 ``5 / 10 / 15 / 30 / 60 / 120 / 180 分钟``、关闭或 **1～1440 分钟自定义**），先悄悄归位原亮度再硬件断信号进入深度省电。",
+            "- **配置热同步**：右键托盘菜单调整或手动编辑 ``%LOCALAPPDATA%\TurnOffScreen\config.txt`` 均自动热生效。",
+            "- **Per-Monitor DPI V2**：完美适配 4K 高分屏与多屏混合缩放。",
+            "",
+            "### 文件校验",
+            "- ``TurnOffScreen.exe`` SHA256: ``$($env:EXE_SHA256)``"
+          )
+          Set-Content -Path .\release_notes.md -Value ($lines -join "`n") -Encoding UTF8
+          gh release create $tag .\dist\TurnOffScreen.exe `
+            --title "$tag - 两段式智能息屏" `
+            --notes-file .\release_notes.md `
+            --verify-tag
